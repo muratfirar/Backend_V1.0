@@ -1,5 +1,6 @@
 from app import create_app, db
 from app.models import User, Firma, FinansalVeri, YevmiyeMaddesiBasligi, YevmiyeFisiSatiri
+
 from dotenv import load_dotenv
 import os
 
