@@ -336,7 +336,3 @@ def generate_gelir_tablosu_v3(donem_ici_hareketler):
         return node
         
     return convert_decimals_to_str_recursive(gelir_tablosu_sonuclari)
-
-```
-
----
