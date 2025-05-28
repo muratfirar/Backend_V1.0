@@ -1,130 +1,177 @@
-from app.models import YevmiyeMaddesiBasligi, YevmiyeFisiSatiri, Firma # Firma import edildi
-from sqlalchemy import func, and_
+from app.models import YevmiyeMaddesiBasligi, YevmiyeFisiSatiri, Firma
+from sqlalchemy import func, and_, or_
 from app import db
 from collections import defaultdict
-from datetime import date
+from datetime import date, timedelta
 import logging
+from decimal import Decimal, ROUND_HALF_UP # Parasal hesaplamalar için Decimal kullanmak daha iyidir
 
+# Uygulama logger'ını kullanmak daha merkezi olabilir, ancak bu şekilde de çalışır.
+# from flask import current_app
+# logger = current_app.logger
 logger = logging.getLogger(__name__)
+if not logger.handlers: # Birden fazla handler eklenmesini önle
+    handler = logging.StreamHandler() # Veya projenizin ana log handler'ı
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO) # Veya DEBUG
 
 # HESAP PLANI EŞLEŞTİRME VE NİTELİKLERİ
+# type: 'A' (Aktif), 'P' (Pasif), 'OZ' (Özkaynak),
+#       'GELIR' (Gelir), 'GIDER' (Gider/Maliyet), 'INDIRIM' (Satış İndirimi),
+#       'REG_A' (Düzenleyici Aktif -), 'REG_P' (Düzenleyici Pasif/Özkaynak -)
 # normal_balance: 'D' (Debit/Borç), 'C' (Credit/Alacak)
-# fs_impact: Mali tabloda toplama nasıl etki edeceği (1: pozitif, -1: negatif)
-#            Örn: Satış İndirimleri (610) normalde Borç bakiyesi verir ama Net Satışları azaltır.
-#            Maliyet ve Gider hesapları Borç bakiyesi verir ama Karı azaltır.
+# fs_section: 'BILANCO_AKTIF', 'BILANCO_PASIF', 'GELIR_TABLOSU'
+# fs_group: Mali tablodaki ana grup adı (BILANCO_YAPISI ve GELIR_TABLOSU_YAPISI'ndaki anahtarlarla eşleşmeli)
+# fs_sub_group: Mali tablodaki alt grup adı
 HESAP_DETAYLARI = {
-    # DÖNEN VARLIKLAR (Genellikle Borç Bakiyesi Verir, Bilançoda Pozitif)
-    '100': {'adi': 'KASA', 'grup': 'HAZIR_DEGERLER', 'fs_kalem': 'DONEN_VARLIKLAR', 'normal_balance': 'D', 'fs_impact': 1},
-    '101': {'adi': 'ALINAN ÇEKLER', 'grup': 'HAZIR_DEGERLER', 'fs_kalem': 'DONEN_VARLIKLAR', 'normal_balance': 'D', 'fs_impact': 1},
-    '102': {'adi': 'BANKALAR', 'grup': 'HAZIR_DEGERLER', 'fs_kalem': 'DONEN_VARLIKLAR', 'normal_balance': 'D', 'fs_impact': 1},
-    '120': {'adi': 'ALICILAR', 'grup': 'TICARI_ALACAKLAR', 'fs_kalem': 'DONEN_VARLIKLAR', 'normal_balance': 'D', 'fs_impact': 1},
-    '121': {'adi': 'ALACAK SENETLERİ', 'grup': 'TICARI_ALACAKLAR', 'fs_kalem': 'DONEN_VARLIKLAR', 'normal_balance': 'D', 'fs_impact': 1},
-    '153': {'adi': 'TİCARİ MALLAR', 'grup': 'STOKLAR', 'fs_kalem': 'DONEN_VARLIKLAR', 'normal_balance': 'D', 'fs_impact': 1},
-    '190': {'adi': 'DEVREDEN KDV', 'grup': 'DIGER_DONEN_VARLIKLAR', 'fs_kalem': 'DONEN_VARLIKLAR', 'normal_balance': 'D', 'fs_impact': 1},
-    '191': {'adi': 'İNDİRİLECEK KDV', 'grup': 'DIGER_DONEN_VARLIKLAR', 'fs_kalem': 'DONEN_VARLIKLAR', 'normal_balance': 'D', 'fs_impact': 1},
-    
-    # DURAN VARLIKLAR (Genellikle Borç Bakiyesi Verir, Bilançoda Pozitif)
-    # Örnek olarak birkaçı:
-    '252': {'adi': 'BİNALAR', 'grup': 'MADDI_DURAN_VARLIKLAR', 'fs_kalem': 'DURAN_VARLIKLAR', 'normal_balance': 'D', 'fs_impact': 1},
-    '255': {'adi': 'DEMİRBAŞLAR', 'grup': 'MADDI_DURAN_VARLIKLAR', 'fs_kalem': 'DURAN_VARLIKLAR', 'normal_balance': 'D', 'fs_impact': 1},
-    '257': {'adi': 'BİRİKMİŞ AMORTİSMANLAR', 'grup': 'MADDI_DURAN_VARLIKLAR_INDIRIM', 'fs_kalem': 'DURAN_VARLIKLAR', 'normal_balance': 'C', 'fs_impact': -1}, # (-) Aktifi azaltır
+    # DÖNEN VARLIKLAR
+    '100': {'adi': 'KASA', 'type': 'A', 'normal_balance': 'D', 'fs_section': 'BILANCO_AKTIF', 'fs_group': 'I. DÖNEN VARLIKLAR', 'fs_sub_group': 'A. HAZIR DEĞERLER'},
+    '101': {'adi': 'ALINAN ÇEKLER', 'type': 'A', 'normal_balance': 'D', 'fs_section': 'BILANCO_AKTIF', 'fs_group': 'I. DÖNEN VARLIKLAR', 'fs_sub_group': 'A. HAZIR DEĞERLER'},
+    '102': {'adi': 'BANKALAR', 'type': 'A', 'normal_balance': 'D', 'fs_section': 'BILANCO_AKTIF', 'fs_group': 'I. DÖNEN VARLIKLAR', 'fs_sub_group': 'A. HAZIR DEĞERLER'},
+    '103': {'adi': 'VERİLEN ÇEKLER VE ÖDEME EMİRLERİ (-)', 'type': 'REG_A', 'normal_balance': 'C', 'fs_section': 'BILANCO_AKTIF', 'fs_group': 'I. DÖNEN VARLIKLAR', 'fs_sub_group': 'A. HAZIR DEĞERLER'},
+    '120': {'adi': 'ALICILAR', 'type': 'A', 'normal_balance': 'D', 'fs_section': 'BILANCO_AKTIF', 'fs_group': 'I. DÖNEN VARLIKLAR', 'fs_sub_group': 'C. TİCARİ ALACAKLAR'},
+    '121': {'adi': 'ALACAK SENETLERİ', 'type': 'A', 'normal_balance': 'D', 'fs_section': 'BILANCO_AKTIF', 'fs_group': 'I. DÖNEN VARLIKLAR', 'fs_sub_group': 'C. TİCARİ ALACAKLAR'},
+    '153': {'adi': 'TİCARİ MALLAR', 'type': 'A', 'normal_balance': 'D', 'fs_section': 'BILANCO_AKTIF', 'fs_group': 'I. DÖNEN VARLIKLAR', 'fs_sub_group': 'D. STOKLAR'},
+    '190': {'adi': 'DEVREDEN KDV', 'type': 'A', 'normal_balance': 'D', 'fs_section': 'BILANCO_AKTIF', 'fs_group': 'I. DÖNEN VARLIKLAR', 'fs_sub_group': 'E. DİĞER DÖNEN VARLIKLAR'},
+    '191': {'adi': 'İNDİRİLECEK KDV', 'type': 'A', 'normal_balance': 'D', 'fs_section': 'BILANCO_AKTIF', 'fs_group': 'I. DÖNEN VARLIKLAR', 'fs_sub_group': 'E. DİĞER DÖNEN VARLIKLAR'},
 
-    # KISA VADELİ YABANCI KAYNAKLAR (Genellikle Alacak Bakiyesi Verir, Bilançoda Pozitif)
-    '300': {'adi': 'BANKA KREDİLERİ (KV)', 'grup': 'MALI_BORCLAR_KV', 'fs_kalem': 'KVYK', 'normal_balance': 'C', 'fs_impact': 1},
-    '320': {'adi': 'SATICILAR', 'grup': 'TICARI_BORCLAR_KV', 'fs_kalem': 'KVYK', 'normal_balance': 'C', 'fs_impact': 1},
-    '360': {'adi': 'ÖDENECEK VERGİ VE FONLAR', 'grup': 'ODENECEK_VERGI_VE_DIGER_YUKUMLULUKLER_KV', 'fs_kalem': 'KVYK', 'normal_balance': 'C', 'fs_impact': 1},
-    '391': {'adi': 'HESAPLANAN KDV', 'grup': 'ODENECEK_VERGI_VE_DIGER_YUKUMLULUKLER_KV', 'fs_kalem': 'KVYK', 'normal_balance': 'C', 'fs_impact': 1},
+    # DURAN VARLIKLAR
+    '255': {'adi': 'DEMİRBAŞLAR', 'type': 'A', 'normal_balance': 'D', 'fs_section': 'BILANCO_AKTIF', 'fs_group': 'II. DURAN VARLIKLAR', 'fs_sub_group': 'B. MADDİ DURAN VARLIKLAR'},
+    '257': {'adi': 'BİRİKMİŞ AMORTİSMANLAR (-)', 'type': 'REG_A', 'normal_balance': 'C', 'fs_section': 'BILANCO_AKTIF', 'fs_group': 'II. DURAN VARLIKLAR', 'fs_sub_group': 'B. MADDİ DURAN VARLIKLAR'},
 
-    # UZUN VADELİ YABANCI KAYNAKLAR (Genellikle Alacak Bakiyesi Verir, Bilançoda Pozitif)
-    '400': {'adi': 'BANKA KREDİLERİ (UV)', 'grup': 'MALI_BORCLAR_UV', 'fs_kalem': 'UVYK', 'normal_balance': 'C', 'fs_impact': 1},
+    # KISA VADELİ YABANCI KAYNAKLAR
+    '320': {'adi': 'SATICILAR', 'type': 'P', 'normal_balance': 'C', 'fs_section': 'BILANCO_PASIF', 'fs_group': 'III. KISA VADELİ YABANCI KAYNAKLAR', 'fs_sub_group': 'B. TİCARİ BORÇLAR'},
+    '391': {'adi': 'HESAPLANAN KDV', 'type': 'P', 'normal_balance': 'C', 'fs_section': 'BILANCO_PASIF', 'fs_group': 'III. KISA VADELİ YABANCI KAYNAKLAR', 'fs_sub_group': 'E. ÖDENECEK VERGİ VE DİĞER YÜKÜMLÜLÜKLER'},
 
-    # ÖZKAYNAKLAR (Genellikle Alacak Bakiyesi Verir, Bilançoda Pozitif)
-    '500': {'adi': 'SERMAYE', 'grup': 'ODENMIS_SERMAYE', 'fs_kalem': 'OZKAYNAKLAR', 'normal_balance': 'C', 'fs_impact': 1},
-    '570': {'adi': 'GEÇMİŞ YILLAR KARLARI', 'grup': 'GECMIS_YILLAR_KARLARI_ZARARLARI', 'fs_kalem': 'OZKAYNAKLAR', 'normal_balance': 'C', 'fs_impact': 1},
-    '580': {'adi': 'GEÇMİŞ YILLAR ZARARLARI', 'grup': 'GECMIS_YILLAR_KARLARI_ZARARLARI', 'fs_kalem': 'OZKAYNAKLAR', 'normal_balance': 'D', 'fs_impact': -1}, # (-) Özkaynakları azaltır
-    '590': {'adi': 'DÖNEM NET KARI', 'grup': 'DONEM_NET_KARI_ZARARI', 'fs_kalem': 'OZKAYNAKLAR', 'normal_balance': 'C', 'fs_impact': 1},
-    '591': {'adi': 'DÖNEM NET ZARARI', 'grup': 'DONEM_NET_KARI_ZARARI', 'fs_kalem': 'OZKAYNAKLAR', 'normal_balance': 'D', 'fs_impact': -1}, # (-) Özkaynakları azaltır
+    # ÖZKAYNAKLAR
+    '500': {'adi': 'SERMAYE', 'type': 'OZ', 'normal_balance': 'C', 'fs_section': 'BILANCO_PASIF', 'fs_group': 'V. ÖZKAYNAKLAR', 'fs_sub_group': 'A. ÖDENMİŞ SERMAYE'},
+    '590': {'adi': 'DÖNEM NET KARI', 'type': 'OZ', 'normal_balance': 'C', 'fs_section': 'BILANCO_PASIF', 'fs_group': 'V. ÖZKAYNAKLAR', 'fs_sub_group': 'E. DÖNEM NET KÂRI/ZARARI'},
+    '591': {'adi': 'DÖNEM NET ZARARI (-)', 'type': 'REG_P', 'normal_balance': 'D', 'fs_section': 'BILANCO_PASIF', 'fs_group': 'V. ÖZKAYNAKLAR', 'fs_sub_group': 'E. DÖNEM NET KÂRI/ZARARI'},
+
 
     # GELİR TABLOSU HESAPLARI
-    '600': {'adi': 'YURTİÇİ SATIŞLAR', 'grup': 'BRUT_SATISLAR', 'fs_kalem': 'GELIR_TABLOSU_GELIR', 'normal_balance': 'C', 'fs_impact': 1},
-    '601': {'adi': 'YURTDIŞI SATIŞLAR', 'grup': 'BRUT_SATISLAR', 'fs_kalem': 'GELIR_TABLOSU_GELIR', 'normal_balance': 'C', 'fs_impact': 1},
-    '610': {'adi': 'SATIŞTAN İADELER', 'grup': 'SATIS_INDIRIMLERI', 'fs_kalem': 'GELIR_TABLOSU_GIDER_INDIRIM', 'normal_balance': 'D', 'fs_impact': -1}, # (-)
-    '611': {'adi': 'SATIŞ İSKONTOLARI', 'grup': 'SATIS_INDIRIMLERI', 'fs_kalem': 'GELIR_TABLOSU_GIDER_INDIRIM', 'normal_balance': 'D', 'fs_impact': -1}, # (-)
-    '620': {'adi': 'SATILAN MAMÜLLER MALİYETİ', 'grup': 'SATISLARIN_MALIYETI', 'fs_kalem': 'GELIR_TABLOSU_GIDER_INDIRIM', 'normal_balance': 'D', 'fs_impact': -1}, # (-)
-    '621': {'adi': 'SATILAN TİCARİ MALLAR MALİYETİ', 'grup': 'SATISLARIN_MALIYETI', 'fs_kalem': 'GELIR_TABLOSU_GIDER_INDIRIM', 'normal_balance': 'D', 'fs_impact': -1}, # (-)
-    '632': {'adi': 'GENEL YÖNETİM GİDERLERİ (Yansıtılan)', 'grup': 'FAALIYET_GIDERLERI', 'fs_kalem': 'GELIR_TABLOSU_GIDER_INDIRIM', 'normal_balance': 'D', 'fs_impact': -1}, # (-)
-    '642': {'adi': 'FAİZ GELİRLERİ', 'grup': 'DIGER_FAALIYET_GELIR_KAR', 'fs_kalem': 'GELIR_TABLOSU_GELIR', 'normal_balance': 'C', 'fs_impact': 1},
-    '660': {'adi': 'KISA VADELİ BORÇLANMA GİDERLERİ', 'grup': 'FINANSMAN_GIDERLERI', 'fs_kalem': 'GELIR_TABLOSU_GIDER_INDIRIM', 'normal_balance': 'D', 'fs_impact': -1}, # (-)
-    '770': {'adi': 'GENEL YÖNETİM GİDERLERİ', 'grup': '_MALIYET_HESABI', 'fs_kalem': '_MALIYET_HESABI', 'normal_balance': 'D', 'fs_impact': 1}, # Yansıtma öncesi
-    # ... diğer hesaplar ve daha detaylı gruplamalar eklenebilir ...
+    '600': {'adi': 'YURTİÇİ SATIŞLAR', 'type': 'GELIR', 'normal_balance': 'C', 'fs_section': 'GELIR_TABLOSU', 'fs_group': 'A. BRÜT SATIŞLAR'},
+    '610': {'adi': 'SATIŞTAN İADELER (-)', 'type': 'INDIRIM', 'normal_balance': 'D', 'fs_section': 'GELIR_TABLOSU', 'fs_group': 'B. SATIŞ İNDİRİMLERİ (-)'},
+    '621': {'adi': 'SATILAN TİCARİ MALLAR MALİYETİ (-)', 'type': 'GIDER', 'normal_balance': 'D', 'fs_section': 'GELIR_TABLOSU', 'fs_group': 'C. SATIŞLARIN MALİYETİ (-)'},
+    '632': {'adi': 'GENEL YÖNETİM GİDERLERİ (Yansıtılan)', 'type': 'GIDER', 'normal_balance': 'D', 'fs_section': 'GELIR_TABLOSU', 'fs_group': 'D. FAALİYET GİDERLERİ (-)'}, # Bu grup adı YAPISI ile eşleşmeli
+    '642': {'adi': 'FAİZ GELİRLERİ', 'type': 'GELIR', 'normal_balance': 'C', 'fs_section': 'GELIR_TABLOSU', 'fs_group': 'E. DİĞER FAALİYETLERDEN OLAĞAN GELİR VE KÂRLAR'},
+    '660': {'adi': 'KISA VADELİ BORÇLANMA GİDERLERİ (-)', 'type': 'GIDER', 'normal_balance': 'D', 'fs_section': 'GELIR_TABLOSU', 'fs_group': 'G. FİNANSMAN GİDERLERİ (-)'},
+    '770': {'adi': 'GENEL YÖNETİM GİDERLERİ (Maliyet)', 'type': 'GIDER_MALIYET', 'normal_balance': 'D'}, # Doğrudan GT'ye değil, 632'ye yansır
 }
 
-# Ana Mali Tablo Kalemlerini Tanımlama (HESAP_PLANI_MAP'teki fs_kalem ve grup anahtarlarına göre)
+# MALİ TABLO YAPI ŞABLONLARI (Daha Detaylı ve TDHP'ye Yakın)
 BILANCO_YAPISI = {
     "AKTIFLER": {
-        "I. DÖNEN VARLIKLAR": ['HAZIR_DEGERLER', 'MENKUL_KIYMETLER', 'TICARI_ALACAKLAR', 'STOKLAR', 'DIGER_DONEN_VARLIKLAR'],
-        "II. DURAN VARLIKLAR": ['TICARI_ALACAKLAR_DV', 'MADDI_DURAN_VARLIKLAR', 'MADDI_OLMAYAN_DURAN_VARLIKLAR', 'OZEL_TUKENMEYE_TABI_VARLIKLAR']
+        "I. DÖNEN VARLIKLAR": {
+            "A. HAZIR DEĞERLER": ['100', '101', '102', '103', '108'],
+            "C. TİCARİ ALACAKLAR": ['120', '121', '122', '128', '129'], # 122, 129 düzenleyici
+            "D. STOKLAR": ['153'],
+            "E. DİĞER DÖNEN VARLIKLAR": ['190', '191']
+        },
+        "II. DURAN VARLIKLAR": {
+            "B. MADDİ DURAN VARLIKLAR": ['252', '254', '255', '257'], # 257 düzenleyici
+        }
+        # ... Diğer Duran Varlık Grupları
     },
     "PASIFLER": {
-        "III. KISA VADELİ YABANCI KAYNAKLAR": ['MALI_BORCLAR_KV', 'TICARI_BORCLAR_KV', 'DIGER_BORCLAR_KV', 'ALINAN_AVANSLAR_KV', 'ODENECEK_VERGI_VE_DIGER_YUKUMLULUKLER_KV', 'BORC_VE_GIDER_KARSILIKLARI_KV'],
-        "IV. UZUN VADELİ YABANCI KAYNAKLAR": ['MALI_BORCLAR_UV', 'TICARI_BORCLAR_UV'],
-        "V. ÖZKAYNAKLAR": ['ODENMIS_SERMAYE', 'SERMAYE_YEDEKLERI', 'KAR_YEDEKLERI', 'GECMIS_YILLAR_KARLARI_ZARARLARI', 'DONEM_NET_KARI_ZARARI']
+        "III. KISA VADELİ YABANCI KAYNAKLAR": {
+            "B. TİCARİ BORÇLAR": ['320'],
+            "E. ÖDENECEK VERGİ VE DİĞER YÜKÜMLÜLÜKLER": ['360','391']
+        },
+        "IV. UZUN VADELİ YABANCI KAYNAKLAR": {
+            # ...
+        },
+        "V. ÖZKAYNAKLAR": {
+            "A. ÖDENMİŞ SERMAYE": ['500'],
+            "D. GEÇMİŞ YILLAR KÂRLARI/ZARARLARI": ['570', '580'], # 580 düzenleyici
+            "E. DÖNEM NET KÂRI/ZARARI": ['590', '591'] # 591 düzenleyici
+        }
     }
 }
 
-GELIR_TABLOSU_YAPISI = [ # Sıralı olması önemli
-    ('A. BRÜT SATIŞLAR', ['BRUT_SATISLAR'], 1),
-    ('B. SATIŞ İNDİRİMLERİ (-)', ['SATIS_INDIRIMLERI'], -1),
-    ('NET SATIŞLAR', [], 0, lambda gt: gt.get('A. BRÜT SATIŞLAR',0) - gt.get('B. SATIŞ İNDİRİMLERİ (-)',0)), # Hesaplama fonksiyonu
-    ('C. SATIŞLARIN MALİYETİ (-)', ['SATISLARIN_MALIYETI'], -1),
-    ('BRÜT SATIŞ KÂRI (ZARARI)', [], 0, lambda gt: gt.get('NET SATIŞLAR',0) - gt.get('C. SATIŞLARIN MALİYETİ (-)',0)),
-    ('D. FAALİYET GİDERLERİ (-)', ['FAALIYET_GIDERLERI'], -1), # Bu kendi içinde alt toplamları olan bir grup olabilir
-    ('ESAS FAALİYET KÂRI (ZARARI)', [], 0, lambda gt: gt.get('BRÜT SATIŞ KÂRI (ZARARI)',0) - gt.get('D. FAALİYET GİDERLERİ (-)',{}).get('TOPLAM',0)),
-    ('E. DİĞER FAALİYETLERDEN OLAĞAN GELİR VE KÂRLAR', ['DIGER_FAALIYET_GELIR_KAR'], 1),
-    ('F. DİĞER FAALİYETLERDEN OLAĞAN GİDER VE ZARARLAR (-)', ['DIGER_FAALIYET_GIDER_ZARARLAR'], -1),
-    ('OLAĞAN KÂR (ZARAR)', [], 0, lambda gt: gt.get('ESAS FAALİYET KÂRI (ZARARI)',0) + gt.get('E. DİĞER FAALİYETLERDEN OLAĞAN GELİR VE KÂRLAR',0) - gt.get('F. DİĞER FAALİYETLERDEN OLAĞAN GİDER VE ZARARLAR (-)',0)),
-    ('G. FİNANSMAN GİDERLERİ (-)', ['FINANSMAN_GIDERLERI'], -1),
-    ('SÜRDÜRÜLEN FAALİYETLER VERGİ ÖNCESİ KÂRI (ZARARI)', [], 0, lambda gt: gt.get('OLAĞAN KÂR (ZARAR)',0) - gt.get('G. FİNANSMAN GİDERLERİ (-)',0)),
-    # ... (Vergi ve Net Kar/Zarar hesaplamaları)
+GELIR_TABLOSU_YAPISI = [
+    {'kalem_adi': 'A. BRÜT SATIŞLAR', 'hesap_gruplari': ['A_BRUT_SATISLAR']},
+    {'kalem_adi': 'B. SATIŞ İNDİRİMLERİ (-)', 'hesap_gruplari': ['B_SATIS_INDIRIMLERI']},
+    {'kalem_adi': 'NET SATIŞLAR', 'hesaplama': lambda gt: gt.get('A. BRÜT SATIŞLAR', Decimal(0)) + gt.get('B. SATIŞ İNDİRİMLERİ (-)', Decimal(0))}, # İndirimler zaten negatif fs_impact ile gelecek
+    {'kalem_adi': 'C. SATIŞLARIN MALİYETİ (-)', 'hesap_gruplari': ['C_SATISLARIN_MALIYETI']},
+    {'kalem_adi': 'BRÜT SATIŞ KÂRI (ZARARI)', 'hesaplama': lambda gt: gt.get('NET SATIŞLAR', Decimal(0)) + gt.get('C. SATIŞLARIN MALİYETİ (-)', Decimal(0))}, # SMM zaten negatif fs_impact ile gelecek
+    {'kalem_adi': 'D. FAALİYET GİDERLERİ (-)', 'hesap_gruplari': ['D_FAALIYET_GIDERLERI_GYG']}, # HESAP_DETAYLARI'ndaki grup adı ile eşleşmeli
+    {'kalem_adi': 'ESAS FAALİYET KÂRI (ZARARI)', 'hesaplama': lambda gt: gt.get('BRÜT SATIŞ KÂRI (ZARARI)', Decimal(0)) + gt.get('D. FAALİYET GİDERLERİ (-)', Decimal(0))},
+    {'kalem_adi': 'E. DİĞER FAALİYETLERDEN OLAĞAN GELİR VE KÂRLAR', 'hesap_gruplari': ['E_DIGER_FAALIYET_GELIR_KAR']},
+    # {'kalem_adi': 'F. DİĞER FAALİYETLERDEN OLAĞAN GİDER VE ZARARLAR (-)', 'hesap_gruplari': ['F_DIGER_FAALIYET_GIDER_ZARARLAR']}, # Bu grup HESAP_DETAYLARI'nda tanımlanmalı
+    {'kalem_adi': 'OLAĞAN KÂR (ZARAR)', 'hesaplama': lambda gt: gt.get('ESAS FAALİYET KÂRI (ZARARI)', Decimal(0)) + gt.get('E. DİĞER FAALİYETLERDEN OLAĞAN GELİR VE KÂRLAR', Decimal(0)) }, # + gt.get('F. DİĞER FAALİYETLERDEN OLAĞAN GİDER VE ZARARLAR (-)', Decimal(0))
+    {'kalem_adi': 'G. FİNANSMAN GİDERLERİ (-)', 'hesap_gruplari': ['G_FINANSMAN_GIDERLERI']},
+    {'kalem_adi': 'SÜRDÜRÜLEN FAALİYETLER VERGİ ÖNCESİ KÂRI (ZARARI)', 'hesaplama': lambda gt: gt.get('OLAĞAN KÂR (ZARAR)', Decimal(0)) + gt.get('G. FİNANSMAN GİDERLERİ (-)', Decimal(0))},
+    # TODO: Dönem Karı Vergi Karşılıkları ve Dönem Net Karı/Zararı
 ]
 
 
-def get_hesap_bakiyeleri_for_period(firma_id: int, donem_baslangic_date: date, donem_bitis_date: date):
+def get_donem_sonu_bakiyeleri(firma_id: int, donem_bitis_date: date):
     """
-    Belirtilen firma ve dönem aralığı için hesapların net hareketlerini veya dönem sonu bakiyelerini hesaplar.
-    Yevmiye Defteri'nden hareketleri alır.
-    Dönem başı bakiyelerini (devir) de dikkate almak daha kapsamlı bir çözüm gerektirir.
-    Bu fonksiyon, belirtilen dönem içindeki *hareketleri* baz alarak bir tür "dönem mizanı" oluşturur.
+    Belirtilen firma ve dönem sonu tarihi itibarıyla tüm hesapların
+    kümülatif dönem sonu bakiyelerini hesaplar.
+    Bu, Bilanço için gereklidir.
     """
     try:
-        yevmiye_baslik_ids_query = db.session.query(YevmiyeMaddesiBasligi.id)\
-            .filter(
-                YevmiyeMaddesiBasligi.firma_id == firma_id,
-                # Yevmiye maddesinin muhasebe tarihi (postingDate) üzerinden filtreleme yapılmalı.
-                # YevmiyeMaddesiBasligi.dosya_donemi_bitis yerine, satırların muhasebe_kayit_tarihi kullanılmalı.
-            )
-        
-        # İlgili döneme ait tüm yevmiye satırlarını çek
-        # Bu sorgu, yevmiye satırlarının muhasebe_kayit_tarihi'ne göre filtrelenmeli.
-        # Ve bu satırların ait olduğu yevmiye başlıklarının da ilgili döneme ait olması sağlanmalı.
-        # Örnek XML'de dosya_donemi_bitis var ama fişlerin kendi muhasebe tarihleri daha önemli.
-
-        # Basitlik adına, dosya_donemi_bitis'i eşleşen tüm kayıtları alıyoruz.
-        # Gerçek bir dönem analizi için bu sorgunun daha hassas olması gerekir.
-        # Örneğin, tüm geçmiş hareketleri alıp kümülatif bakiye hesaplamak (Bilanço için)
-        # veya sadece dönem içi hareketleri almak (Gelir Tablosu için).
-
-        ilgili_maddeler_ids = db.session.query(YevmiyeMaddesiBasligi.id)\
-            .filter(YevmiyeMaddesiBasligi.firma_id == firma_id,
-                    YevmiyeMaddesiBasligi.dosya_donemi_bitis >= donem_baslangic_date, # Veya sadece donem_bitis_date'e eşit olanlar
-                    YevmiyeMaddesiBasligi.dosya_donemi_bitis <= donem_bitis_date
-                    )\
-            .subquery()
-            
         results = db.session.query(
             YevmiyeFisiSatiri.hesap_kodu,
-            func.sum(YevmiyeFisiSatiri.borc_tutari).label('toplam_borc'),
-            func.sum(YevmiyeFisiSatiri.alacak_tutari).label('toplam_alacak')
+            func.sum(YevmiyeFisiSatiri.borc_tutari).label('kümülatif_borc'),
+            func.sum(YevmiyeFisiSatiri.alacak_tutari).label('kümülatif_alacak')
+        ).join(YevmiyeMaddesiBasligi, YevmiyeFisiSatiri.yevmiye_maddesi_id == YevmiyeMaddesiBasligi.id)\
+        .filter(
+            YevmiyeMaddesiBasligi.firma_id == firma_id,
+            YevmiyeFisiSatiri.muhasebe_kayit_tarihi <= donem_bitis_date # O tarihe kadar olan TÜM hareketler
+        ).group_by(
+            YevmiyeFisiSatiri.hesap_kodu
+        ).all()
+
+        hesap_bakiyeleri = {}
+        for row in results:
+            hesap_kodu = row.hesap_kodu
+            kümülatif_borc = Decimal(row.kümülatif_borc or 0.0).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            kümülatif_alacak = Decimal(row.kümülatif_alacak or 0.0).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            
+            hesap_detayi = HESAP_DETAYLARI.get(hesap_kodu) or HESAP_DETAYLARI.get(hesap_kodu[:3])
+            if not hesap_detayi:
+                logger.warning(f"Firma {firma_id}, Dönem Sonu {donem_bitis_date}: Bakiye hesaplamada bilinmeyen hesap kodu {hesap_kodu}.")
+                continue
+
+            net_bakiye = Decimal(0)
+            if hesap_detayi['normal_balance'] == 'D':
+                net_bakiye = kümülatif_borc - kümülatif_alacak
+            elif hesap_detayi['normal_balance'] == 'C':
+                net_bakiye = kümülatif_alacak - kümülatif_borc
+                
+            hesap_bakiyeleri[hesap_kodu] = {
+                'adi': hesap_detayi['adi'],
+                'kümülatif_borc': kümülatif_borc,
+                'kümülatif_alacak': kümülatif_alacak,
+                'dönem_sonu_bakiye': net_bakiye,
+                'normal_balance': hesap_detayi['normal_balance'],
+                'fs_impact_bilanco': hesap_detayi.get('fs_impact_bilanco', 0), # Varsayılan 0, sadece map'te olanlar etki etsin
+                'bilanco_grup': hesap_detayi.get('bilanco_grup')
+            }
+        logger.info(f"Firma {firma_id}, Dönem Sonu {donem_bitis_date} için {len(hesap_bakiyeleri)} hesabın kümülatif bakiyesi hesaplandı.")
+        return hesap_bakiyeleri
+    except Exception as e:
+        logger.error(f"get_donem_sonu_bakiyeleri hata: {e}", exc_info=True)
+        raise
+
+
+def get_donem_ici_hareketler(firma_id: int, donem_baslangic_date: date, donem_bitis_date: date):
+    """
+    Belirtilen firma ve dönem aralığı için hesapların net dönem içi hareketlerini hesaplar.
+    Bu, Gelir Tablosu için gereklidir.
+    """
+    try:
+        # Bu fonksiyon bir önceki yanıttaki get_hesap_bakiyeleri_for_period ile aynı mantıkta
+        # Sadece ismi daha açıklayıcı oldu.
+        results = db.session.query(
+            YevmiyeFisiSatiri.hesap_kodu,
+            func.sum(YevmiyeFisiSatiri.borc_tutari).label('donem_borc_hareket'),
+            func.sum(YevmiyeFisiSatiri.alacak_tutari).label('donem_alacak_hareket')
         ).join(YevmiyeMaddesiBasligi, YevmiyeFisiSatiri.yevmiye_maddesi_id == YevmiyeMaddesiBasligi.id)\
         .filter(
             YevmiyeMaddesiBasligi.firma_id == firma_id,
@@ -134,148 +181,162 @@ def get_hesap_bakiyeleri_for_period(firma_id: int, donem_baslangic_date: date, d
             YevmiyeFisiSatiri.hesap_kodu
         ).all()
 
-        hesap_ozetleri = {}
+        hesap_hareketleri = {}
         for row in results:
             hesap_kodu = row.hesap_kodu
-            toplam_borc = float(row.toplam_borc or 0.0)
-            toplam_alacak = float(row.toplam_alacak or 0.0)
+            donem_borc = Decimal(row.donem_borc_hareket or 0.0).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            donem_alacak = Decimal(row.donem_alacak_hareket or 0.0).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
             
-            hesap_detayi = HESAP_DETAYLARI.get(hesap_kodu) # Ana hesap kodu ile eşleştirme
-            if not hesap_detayi: # Ana hesap değilse veya map'te yoksa, ilk 3 hanesini almayı dene
-                if len(hesap_kodu) > 3:
-                    ana_hesap_kodu = hesap_kodu[:3]
-                    hesap_detayi = HESAP_DETAYLARI.get(ana_hesap_kodu)
+            hesap_detayi = HESAP_DETAYLARI.get(hesap_kodu) or HESAP_DETAYLARI.get(hesap_kodu[:3])
+            if not hesap_detayi:
+                logger.warning(f"Firma {firma_id}, Dönem {donem_baslangic_date}-{donem_bitis_date}: Hareket hesaplamada bilinmeyen hesap kodu {hesap_kodu}.")
+                continue
             
-            net_bakiye = 0
-            if hesap_detayi:
-                if hesap_detayi['normal_balance'] == 'D': # Borç karakterli
-                    net_bakiye = toplam_borc - toplam_alacak
-                elif hesap_detayi['normal_balance'] == 'C': # Alacak karakterli
-                    net_bakiye = toplam_alacak - toplam_borc
-            else: # Bilinmeyen hesap karakteri, varsayılan olarak borç bakiyesi
-                net_bakiye = toplam_borc - toplam_alacak
+            # Gelir tablosu hesapları için dönem içi net hareket
+            net_hareket = Decimal(0)
+            if hesap_detayi['normal_balance'] == 'D': # Gider/Maliyet/İndirim hesapları
+                net_hareket = donem_borc - donem_alacak
+            elif hesap_detayi['normal_balance'] == 'C': # Gelir hesapları
+                net_hareket = donem_alacak - donem_borc
                 
-            hesap_ozetleri[hesap_kodu] = {
-                'adi': hesap_detayi['adi'] if hesap_detayi else 'Bilinmeyen Hesap',
-                'borc_hareket': toplam_borc,
-                'alacak_hareket': toplam_alacak,
-                'net_bakiye_veya_hareket': net_bakiye, # Bu, dönemsel hareket veya dönem sonu bakiye olabilir
-                'normal_balance': hesap_detayi['normal_balance'] if hesap_detayi else 'D',
-                'fs_impact': hesap_detayi['fs_impact'] if hesap_detayi else 1
+            hesap_hareketleri[hesap_kodu] = {
+                'adi': hesap_detayi['adi'],
+                'donem_borc_hareket': donem_borc,
+                'donem_alacak_hareket': donem_alacak,
+                'net_donem_hareketi': net_hareket,
+                'normal_balance': hesap_detayi['normal_balance'],
+                'fs_impact_gelir_tablosu': hesap_detayi.get('fs_impact_gelir_tablosu', 0),
+                'gelir_tablosu_grup': hesap_detayi.get('gelir_tablosu_grup')
             }
-        logger.info(f"Firma {firma_id}, Dönem {donem_baslangic_date}-{donem_bitis_date} için hesap hareketleri özeti: {len(hesap_ozetleri)} hesap.")
-        return hesap_ozetleri
+        logger.info(f"Firma {firma_id}, Dönem {donem_baslangic_date}-{donem_bitis_date} için {len(hesap_hareketleri)} hesabın dönem içi hareketi hesaplandı.")
+        return hesap_hareketleri
     except Exception as e:
-        logger.error(f"get_hesap_bakiyeleri_for_period hata: {e}", exc_info=True)
-        raise # Hatanın yukarıya fırlatılması, route'da yakalanacak
+        logger.error(f"get_donem_ici_hareketler hata: {e}", exc_info=True)
+        raise
 
+def _generate_fs_recursive(hesap_verileri, yapi_seviyesi, anahtar_bakiye_alanı, anahtar_impact_alanı, anahtar_grup_alanı):
+    """ Mali tablo kalemlerini ve alt toplamlarını rekürsif olarak hesaplar. """
+    kalem_sonuclari = {}
+    seviye_toplami = Decimal(0)
 
-def _recursive_map_hesaplar(hesap_bakiyeleri, tablo_yapi_grubu):
-    """
-    Verilen tablo yapısı ve hesap bakiyelerine göre mali tablo kalemlerini hesaplar.
-    İç içe grupları da (şimdilik tek seviye) destekler.
-    """
-    grup_toplamlari = {}
-    genel_toplam = 0
-    for kalem_adi, hesap_kod_listesi_veya_altgrup in tablo_yapi_grubu.items():
-        if isinstance(hesap_kod_listesi_veya_altgrup, list): # Doğrudan hesap kod listesi
-            kalem_degeri = 0
-            for kod in hesap_kod_listesi_veya_altgrup:
-                if kod in hesap_bakiyeleri:
-                    detay = HESAP_DETAYLARI.get(kod)
-                    # Bilanço kalemleri için net bakiyeyi, gelir tablosu için dönemsel hareketi (net_bakiye_veya_hareket) kullan.
-                    # fs_impact ile çarp.
-                    if detay:
-                         # Aktifler ve giderler için (normal_balance='D'), net_bakiye pozitifse fs_impact ile çarpılır.
-                         # Pasifler ve gelirler için (normal_balance='C'), net_bakiye pozitifse fs_impact ile çarpılır.
-                         # Düzenleyici hesaplar (örn: 257, 580, 610) kendi fs_impact'lerine göre etki eder.
-                        kalem_degeri += hesap_bakiyeleri[kod]['net_bakiye_veya_hareket'] * detay.get('fs_impact', 1)
-            grup_toplamlari[kalem_adi] = kalem_degeri
-            genel_toplam += kalem_degeri
-        elif isinstance(hesap_kod_listesi_veya_altgrup, dict): # Alt grup
-            alt_grup_sonuclari, alt_grup_toplami_degeri = _recursive_map_hesaplar(hesap_bakiyeleri, hesap_kod_listesi_veya_altgrup)
-            grup_toplamlari[kalem_adi] = alt_grup_sonuclari
-            grup_toplamlari[kalem_adi]['TOPLAM'] = alt_grup_toplami_degeri
-            genel_toplam += alt_grup_toplami_degeri
+    for grup_adi, alt_yapi in yapi_seviyesi.items(): # Örn: "I. DÖNEN VARLIKLAR", {"A. HAZIR DEĞERLER": [...]}
+        if isinstance(alt_yapi, dict): # Bu bir ana grup, içini işle (alt gruplar)
+            alt_grup_sonuclari, alt_grup_toplami = _generate_fs_recursive(hesap_verileri, alt_yapi, anahtar_bakiye_alanı, anahtar_impact_alanı, anahtar_grup_alanı)
+            kalem_sonuclari[grup_adi] = alt_grup_sonuclari
+            if alt_grup_toplami is not None : # Eğer alt grup toplamı hesaplanabildiyse
+                 kalem_sonuclari[grup_adi]['GRUP_TOPLAMI'] = alt_grup_toplami
+                 seviye_toplami += alt_grup_toplami
+        elif isinstance(alt_yapi, list): # Bu bir alt grup, hesap kodlarını içerir
+            alt_grup_toplami_degeri = Decimal(0)
+            alt_grup_detaylari = {}
+            for kod in alt_yapi: # ['100', '101', ...]
+                if kod in hesap_verileri:
+                    hesap_data = hesap_verileri[kod]
+                    bakiye = hesap_data[anahtar_bakiye_alanı] # 'dönem_sonu_bakiye' veya 'net_donem_hareketi'
+                    impact = Decimal(hesap_data.get(anahtar_impact_alanı, 1)) # HESAP_DETAYLARI'ndan gelen impact
+                    
+                    # Düzenleyici hesaplar için impact zaten negatif olmalı.
+                    # Bakiye * impact, kalemin toplama olan net etkisini verir.
+                    etkilenmis_bakiye = bakiye * impact
+                    alt_grup_detaylari[f"{kod} {hesap_data.get('adi','')}"] = etkilenmis_bakiye
+                    alt_grup_toplami_degeri += etkilenmis_bakiye # Burada impact zaten uygulandı
+            kalem_sonuclari[grup_adi] = {
+                "detay": alt_grup_detaylari,
+                "ALT_GRUP_TOPLAMI": alt_grup_toplami_degeri
+            }
+            seviye_toplami += alt_grup_toplami_degeri
             
-    return grup_toplamlari, genel_toplam
+    return kalem_sonuclari, seviye_toplami
 
 
-def generate_bilanco_from_ Bewegungen(hesap_bakiyeleri_donem_hareketleri):
+def generate_bilanco_v3(donem_sonu_bakiyeleri):
     bilanco = {"AKTIFLER": {}, "PASIFLER": {}}
-    
-    # Bilanço hesapları için dönem sonu bakiyeleri gerekir.
-    # Şu anki get_hesap_bakiyeleri_for_period fonksiyonu DÖNEM İÇİ HAREKETLERİ veriyor.
-    # Gerçek bilanço için ya açılış bakiyeleri + dönem içi hareketler ya da direkt dönem sonu bakiyeleri gerekir.
-    # Bu prototipte, hesap_bakiyeleri_donem_hareketleri'ndeki 'net_bakiye_veya_hareket' alanını
-    # sanki dönem sonu bakiyesiymiş gibi kullanacağız (bu büyük bir basitleştirmedir).
-    # TODO: Gerçek dönem sonu bakiye hesaplama mantığı eklenmeli.
-    
-    logger.info("Bilanço oluşturuluyor (basitleştirilmiş dönem sonu bakiye varsayımı ile)...")
-    
-    aktif_gruplari, aktif_toplami = _recursive_map_hesaplar(hesap_bakiyeleri_donem_hareketleri, BILANCO_YAPISI["AKTIFLER"])
-    bilanco["AKTIFLER"] = aktif_gruplari
-    bilanco["AKTIFLER"]["GENEL_TOPLAM"] = aktif_toplami
+    logger.info("Bilanço v3 oluşturuluyor...")
 
-    pasif_gruplari, pasif_toplami = _recursive_map_hesaplar(hesap_bakiyeleri_donem_hareketleri, BILANCO_YAPISI["PASIFLER"])
-    bilanco["PASIFLER"] = pasif_gruplari
-    bilanco["PASIFLER"]["GENEL_TOPLAM"] = pasif_toplami
-    
-    logger.info(f"Bilanço oluşturuldu. Aktif Toplam: {aktif_toplami}, Pasif Toplam: {pasif_toplami}")
-    if abs(aktif_toplami - pasif_toplami) > 0.01: # Küçük bir tolerans ile denklik kontrolü
-        logger.warning(f"BİLANÇO DENKLİĞİ SAĞLANAMADI! Aktif: {aktif_toplami}, Pasif: {pasif_toplami}")
-        bilanco["DENKLIK_SORUNU"] = f"Aktif ({aktif_toplami}) != Pasif ({pasif_toplami})"
+    try:
+        aktif_detay, aktif_toplami = _generate_fs_recursive(
+            donem_sonu_bakiyeleri, BILANCO_YAPISI["AKTIFLER"],
+            anahtar_bakiye_alanı='dönem_sonu_bakiye',
+            anahtar_impact_alanı='fs_impact_bilanco', # HESAP_DETAYLARI'ndan bu impact'i alacağız
+            anahtar_grup_alanı='bilanco_grup'
+        )
+        bilanco["AKTIFLER"] = aktif_detay
+        bilanco["AKTIFLER"]["GENEL_TOPLAM"] = aktif_toplami
 
-    return bilanco
-
-
-def generate_gelir_tablosu_from_hareketler(hesap_bakiyeleri_donem_hareketleri):
-    gelir_tablosu_hesaplanmis = {}
-    logger.info("Gelir tablosu oluşturuluyor...")
-
-    for kalem_adi, hesap_kod_gruplari, etki_carpani, *hesaplama_fonk in GELIR_TABLOSU_YAPISI:
-        if hesap_kod_gruplari: # Doğrudan hesaplardan toplanacaksa
-            kalem_degeri = 0
-            # Bu kısım _recursive_map_hesaplar gibi daha genel bir yapıya çekilebilir
-            for grup_adi_veya_kod in hesap_kod_gruplari: # grup_adi_veya_kod aslında bir liste
-                # grup_adi_veya_kod burada HESAP_PLANI_MAP içindeki anahtar olmalı
-                # HESAP_PLANI_MAP['GELIR_TABLOSU'][grup_adi_veya_kod]
-                # Bu yapı biraz daha düzeltilmeli. Şimdilik direkt kod listesi gibi varsayalım.
-                # Veya HESAP_DETAYLARI'ndaki 'grup' ve 'fs_kalem' alanlarını kullanalım.
-                
-                # Basitleştirilmiş:
-                for kod in HESAP_PLANI_MAP['GELIR_TABLOSU'].get(grup_adi_veya_kod, []): # Eğer grup_adi_veya_kod bir grup adıysa
-                    if kod in hesap_bakiyeleri_donem_hareketleri:
-                        detay = HESAP_DETAYLARI.get(kod)
-                        if detay:
-                             # Gelir tablosu hesapları için 'net_bakiye_veya_hareket' zaten dönemsel hareketi gösterir.
-                             # fs_impact burada önemli. Gelirler pozitif, giderler/indirimler negatif etki eder.
-                            kalem_degeri += hesap_bakiyeleri_donem_hareketleri[kod]['net_bakiye_veya_hareket'] * detay.get('fs_impact', 1)
-
-            # Gelir tablosunda giderler ve indirimler genellikle pozitif raporlanır ama toplamdan düşülür.
-            # Bizim fs_impact zaten bunu yapıyor olmalı. etki_carpani'nı bu durumda fs_impact'e bırakabiliriz.
-            # Ancak GELIR_TABLOSU_YAPISI'ndaki etki_carpani, kalemin genel toplama etkisini belirtir.
-            gelir_tablosu_hesaplanmis[kalem_adi] = kalem_degeri # etki_carpani'nı sonra uygula
+        pasif_detay, pasif_toplami = _generate_fs_recursive(
+            donem_sonu_bakiyeleri, BILANCO_YAPISI["PASIFLER"],
+            anahtar_bakiye_alanı='dönem_sonu_bakiye',
+            anahtar_impact_alanı='fs_impact_bilanco',
+            anahtar_grup_alanı='bilanco_grup'
+        )
+        bilanco["PASIFLER"] = pasif_detay
+        bilanco["PASIFLER"]["GENEL_TOPLAM"] = pasif_toplami
         
-        elif hesaplama_fonk: # Ara toplam veya hesaplama fonksiyonu varsa
-            gelir_tablosu_hesaplanmis[kalem_adi] = hesaplama_fonk[0](gelir_tablosu_hesaplanmis)
+        logger.info(f"Bilanço v3 oluşturuldu. Aktif Toplam: {aktif_toplami}, Pasif Toplam: {pasif_toplami}")
+        if abs(aktif_toplami - pasif_toplami) > Decimal('0.01'): # Tolerans
+            denklik_farki = aktif_toplami - pasif_toplami
+            logger.warning(f"BİLANÇO DENKLİĞİ SAĞLANAMADI! Fark: {denklik_farki:.2f} (Aktif: {aktif_toplami}, Pasif: {pasif_toplami})")
+            bilanco["DENKLIK_SORUNU"] = f"Fark: {denklik_farki:.2f} (Aktif: {aktif_toplami}, Pasif: {pasif_toplami})"
+    except Exception as e:
+        logger.error(f"generate_bilanco_v3 hata: {e}", exc_info=True)
+        bilanco["HATA"] = str(e)
+
+
+    def convert_decimals_to_str_recursive(node):
+        if isinstance(node, dict):
+            return {k: convert_decimals_to_str_recursive(v) for k, v in node.items()}
+        elif isinstance(node, list):
+            return [convert_decimals_to_str_recursive(item) for item in node]
+        elif isinstance(node, Decimal):
+            return f"{node:.2f}" # İki ondalık basamakla string'e çevir
+        return node
+        
+    return convert_decimals_to_str_recursive(bilanco)
+
+
+def generate_gelir_tablosu_v3(donem_ici_hareketler):
+    gelir_tablosu_sonuclari = {}
+    logger.info("Gelir Tablosu v3 oluşturuluyor...")
     
-    # Netleştirmek için: Gider ve indirimler pozitif değerler olarak hesaplandıysa, ana toplamlardan çıkarılacaklar.
-    # GELIR_TABLOSU_YAPISI'ndaki etki_carpani'nı kullanarak sonuçları ayarlayalım.
-    # Bu örnekte, _calculate_kalem_toplami zaten fs_impact'i kullandığı için,
-    # GELIR_TABLOSU_YAPISI'ndaki etki_carpani, o kalemin genel toplama işaretini belirtebilir.
-    # Şu anki yapıda _calculate_kalem_toplami ve HESAP_DETAYLARI['fs_impact'] ana mantığı taşıyor.
-    # GELIR_TABLOSU_YAPISI'ndaki hesaplama fonksiyonları daha doğru bir yaklaşım.
+    try:
+        for item in GELIR_TABLOSU_YAPISI:
+            kalem_adi = item['kalem_adi']
+            if 'hesaplama' in item and callable(item['hesaplama']):
+                # Ara toplamlar veya özel hesaplamalar
+                gelir_tablosu_sonuclari[kalem_adi] = item['hesaplama'](gelir_tablosu_sonuclari)
+            elif 'hesap_gruplari' in item:
+                kalem_toplami = Decimal(0)
+                detaylar = {}
+                for grup_anahtari in item['hesap_gruplari']: # örn: 'A_BRUT_SATISLAR'
+                    for kod, hesap_data in donem_ici_hareketler.items():
+                        if hesap_data.get('gelir_tablosu_grup') == grup_anahtari:
+                            hareket = hesap_data['net_donem_hareketi']
+                            # fs_impact_gelir_tablosu HESAP_DETAYLARI'ndan gelir ve zaten +/- içerir.
+                            # Gelirler pozitif, giderler/indirimler negatif impact'e sahip olmalı.
+                            etkilenmis_hareket = hareket * Decimal(hesap_data.get('fs_impact_gelir_tablosu', 1))
+                            detaylar[f"{kod} {hesap_data.get('adi','')}"] = etkilenmis_hareket
+                            kalem_toplami += etkilenmis_hareket
+                gelir_tablosu_sonuclari[kalem_adi] = {
+                    "TUTAR": kalem_toplami,
+                    "DETAY": detaylar
+                } if detaylar else kalem_toplami # Eğer detay yoksa sadece tutarı ver
+    except Exception as e:
+        logger.error(f"generate_gelir_tablosu_v3 hata: {e}", exc_info=True)
+        gelir_tablosu_sonuclari["HATA"] = str(e)
 
-    # Örnekteki lambda fonksiyonlarını kullanarak ara toplamları hesaplayalım.
-    # Bu, GELIR_TABLOSU_YAPISI'nın doğru işlenmesini gerektirir.
-    # Bu kısım daha robust bir şekilde, yapıya göre iteratif hesaplama yapmalı.
-    # Geçici olarak bazı anahtar kalemleri manuel hesaplayalım (yapıdaki lambdalara göre):
-    if 'NET SATIŞLAR' not in gelir_tablosu_hesaplanmis and callable(GELIR_TABLOSU_YAPISI[2][3]):
-         gelir_tablosu_hesaplanmis['NET SATIŞLAR'] = GELIR_TABLOSU_YAPISI[2][3](gelir_tablosu_hesaplanmis)
-    if 'BRÜT SATIŞ KÂRI (ZARARI)' not in gelir_tablosu_hesaplanmis and callable(GELIR_TABLOSU_YAPISI[4][3]):
-         gelir_tablosu_hesaplanmis['BRÜT SATIŞ KÂRI (ZARARI)'] = GELIR_TABLOSU_YAPISI[4][3](gelir_tablosu_hesaplanmis)
-    # ... diğer ara toplamlar ...
+    logger.info(f"Gelir Tablosu v3 oluşturuldu: Net Satışlar: {gelir_tablosu_sonuclari.get('NET SATIŞLAR')}")
 
-    logger.info(f"Gelir Tablosu (basitleştirilmiş) oluşturuldu: {gelir_tablosu_hesaplanmis.get('NET SATIŞLAR')}")
-    return gelir_tablosu_hesaplanmis
+    def convert_decimals_to_str_recursive(node):
+        if isinstance(node, dict):
+            return {k: convert_decimals_to_str_recursive(v) for k, v in node.items()}
+        elif isinstance(node, list):
+            return [convert_decimals_to_str_recursive(item) for item in node]
+        elif isinstance(node, Decimal):
+            return f"{node:.2f}"
+        return node
+        
+    return convert_decimals_to_str_recursive(gelir_tablosu_sonuclari)
+
+```
+
+---

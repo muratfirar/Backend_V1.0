@@ -2,9 +2,7 @@ from flask import Blueprint, request, jsonify, current_app
 from app import db
 from app.models import User, Firma, FinansalVeri
 from app.services import calculate_cari_oran, calculate_borc_ozkaynak_orani, calculate_altman_z_score_updated
-from app.financial_statement_service import get_hesap_hareketleri_ozeti, generate_bilanco, generate_gelir_tablosu
-
-from app.financial_statement_service import get_hesap_bakiyeleri_for_period, generate_bilanco, generate_gelir_tablosu
+from app.financial_statement_service import get_donem_sonu_bakiyeleri, get_donem_ici_hareketler, generate_bilanco_v3, generate_gelir_tablosu_v3
 
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 import pandas as pd
