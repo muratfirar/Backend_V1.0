@@ -2,6 +2,10 @@ from flask import Blueprint, request, jsonify, current_app
 from app import db
 from app.models import User, Firma, FinansalVeri
 from app.services import calculate_cari_oran, calculate_borc_ozkaynak_orani, calculate_altman_z_score_updated
+from app.financial_statement_service import get_hesap_hareketleri_ozeti, generate_bilanco, generate_gelir_tablosu
+
+from app.financial_statement_service import get_hesap_bakiyeleri_for_period, generate_bilanco, generate_gelir_tablosu
+
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 import pandas as pd
 import io
@@ -356,3 +360,76 @@ def upload_edefter_xml(firma_id):
             return jsonify({"msg": "E-defter yüklenirken beklenmedik bir hata oluştu.", "error": str(e)}), 500
     else:
         return jsonify({"msg": "Geçersiz dosya formatı. Lütfen .xml uzantılı bir e-defter dosyası yükleyin."}), 400
+# app/routes.py içine eklenecek
+# from app.financial_statement_service import get_hesap_bakiyeleri, generate_bilanco_from_hesap_bakiyeleri, generate_gelir_tablosu_from_hesap_bakiyeleri # Eğer ayrı bir dosyaya taşıdıysanız
+# Veya services.py içindeyse oradan import edin. Şimdilik aynı dosyada olduğunu varsayalım.
+
+@bp.route('/firmalar/<int:firma_id>/mali_tablolar', methods=['GET'])
+@jwt_required()
+def get_mali_tablolar(firma_id):
+    current_app.logger.debug(f"/mali_tablolar endpoint'i çağrıldı. Firma ID: {firma_id}")
+    # current_user_id = int(get_jwt_identity()) # Yetkilendirme için kullanılabilir
+    firma = Firma.query.get_or_404(firma_id)
+    # Yetkilendirme kontrolü eklenebilir
+
+    donem_baslangic_str = request.args.get('donem_baslangic') # YYYY-AA-GG
+    donem_bitis_str = request.args.get('donem_bitis')       # YYYY-AA-GG
+
+    if not donem_baslangic_str or not donem_bitis_str:
+        return jsonify({"msg": "Lütfen 'donem_baslangic' ve 'donem_bitis' parametrelerini YYYY-AA-GG formatında sağlayın."}), 400
+    
+    try:
+        donem_baslangic_date = datetime.strptime(donem_baslangic_str, '%Y-%m-%d').date()
+        donem_bitis_date = datetime.strptime(donem_bitis_str, '%Y-%m-%d').date()
+        if donem_baslangic_date > donem_bitis_date:
+            return jsonify({"msg": "Başlangıç tarihi bitiş tarihinden sonra olamaz."}), 400
+    except ValueError:
+        return jsonify({"msg": "Geçersiz tarih formatı. Lütfen YYYY-AA-GG kullanın."}), 400
+
+    try:
+        current_app.logger.info(f"Firma {firma_id} için {donem_baslangic_str} - {donem_bitis_str} dönemi hesap bakiyeleri çekiliyor...")
+        hesap_bakiyeleri_donem = get_hesap_bakiyeleri_for_period(firma_id, donem_baslangic_date, donem_bitis_date)
+        
+        if not hesap_bakiyeleri_donem:
+            current_app.logger.warning(f"Firma {firma_id}, Dönem {donem_baslangic_str}-{donem_bitis_str} için hesap özeti bulunamadı.")
+            return jsonify({"msg": f"Belirtilen dönem için işlenmiş yevmiye verisi veya hesap özeti bulunamadı."}), 404
+
+        current_app.logger.info(f"Firma {firma_id} için Bilanço oluşturuluyor...")
+        bilanco = generate_bilanco(hesap_bakiyeleri_donem)
+        
+        current_app.logger.info(f"Firma {firma_id} için Gelir Tablosu oluşturuluyor...")
+        gelir_tablosu = generate_gelir_tablosu(hesap_bakiyeleri_donem)
+        
+        # İsteğe bağlı: Bu türetilmiş özetleri FinansalVeri tablosuna kaydetme mantığı
+        # (Bir önceki yanıtta bahsedilmişti, buraya eklenebilir)
+        # Örneğin:
+        # ozet_donem_adi = f"{donem_bitis_date.year}-{donem_bitis_date.month:02d}" # Veya daha uygun bir dönem adı
+        # FinansalVeri.query.filter_by(firma_id=firma.id, donem=ozet_donem_adi).delete()
+        # yeni_ozet_veri = FinansalVeri(
+        #     firma_id=firma.id,
+        #     donem=ozet_donem_adi,
+        #     aktif_toplami = bilanco.get('AKTIFLER', {}).get('GENEL_TOPLAM', 0),
+        #     donen_varliklar = bilanco.get('AKTIFLER', {}).get('I. DÖNEN VARLIKLAR', {}).get('TOPLAM', 0),
+        #     # ... diğer bilanço kalemleri ...
+        #     kisa_vadeli_yukumlulukler = bilanco.get('PASIFLER', {}).get('III. KISA VADELİ YABANCI KAYNAKLAR', {}).get('TOPLAM', 0),
+        #     oz_kaynaklar = bilanco.get('PASIFLER', {}).get('V. ÖZKAYNAKLAR', {}).get('TOPLAM', 0),
+        #     net_satislar = gelir_tablosu.get('NET SATIŞLAR', 0),
+        #     # ... diğer gelir tablosu kalemleri ...
+        # )
+        # db.session.add(yeni_ozet_veri)
+        # db.session.commit()
+        # current_app.logger.info(f"Firma {firma_id}, Dönem {ozet_donem_adi} için özet FinansalVeri tablosu güncellendi/oluşturuldu.")
+
+
+    except Exception as e:
+        current_app.logger.error(f"Mali tablo API'sinde hata (Firma ID: {firma_id}, Dönem: {donem_baslangic_str}-{donem_bitis_str}): {e}", exc_info=True)
+        return jsonify({"msg": "Mali tablolar alınırken sunucu içi bir hata oluştu."}), 500
+        
+    return jsonify({
+        "firma_id": firma_id,
+        "donem_baslangic": donem_baslangic_str,
+        "donem_bitis": donem_bitis_str,
+        "bilanco": bilanco,
+        "gelir_tablosu": gelir_tablosu,
+        # "debug_hesap_bakiyeleri": hesap_bakiyeleri_donem # Debug için
+    }), 200
